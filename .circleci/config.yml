@@ -1,26 +1,263 @@
-# Use the latest 2.1 version of CircleCI pipeline process engine.
-# See: https://circleci.com/docs/2.0/configuration-reference
-version: 2.1
+version: 2
 
-# Define a job to be invoked later in a workflow.
-# See: https://circleci.com/docs/2.0/configuration-reference/#jobs
+workspace: &workspace
+             /root
+attach_base_build_workspace: &attach_base_build_workspace
+  attach_workspace:
+    at: *workspace
+persist_base_build_workspace: &persist_base_build_workspace
+  persist_to_workspace:
+    root: *workspace
+    paths:
+      - project
+base_circle_image: &base_circle_image
+  docker:
+    - image: "183303791235.dkr.ecr.us-east-1.amazonaws.com/api-circle:latest"
+      aws_auth:
+        aws_access_key_id: $AWS_ACCESS_KEY_ID
+        aws_secret_access_key: $AWS_SECRET_ACCESS_KEY
+    - image: "mongo:3.6.3"
+    - image: "redis:5"
+  environment:
+    KUBECONFIG: /root/project/.kube/config-bnc-api.yaml
+
 jobs:
-  say-hello:
-    # Specify the execution environment. You can specify an image from Dockerhub or use one of our Convenience Images from CircleCI's Developer Hub.
-    # See: https://circleci.com/docs/2.0/configuration-reference/#docker-machine-macos-windows-executor
-    docker:
-      - image: cimg/base:stable
-    # Add steps to the job
-    # See: https://circleci.com/docs/2.0/configuration-reference/#steps
+  build-api-server:
+    <<: *base_circle_image
+    environment:
+      TZ: America/Chicago
     steps:
       - checkout
+      - restore_cache:
+          keys:
+            - yarn-packages-v1-{{ .Branch }}-{{ checksum "yarn.lock" }}
+            - yarn-packages-v1-{{ .Branch }}-
+            - yarn-packages-v1-
       - run:
-          name: "Say hello"
-          command: "echo Hello, World!"
+          name: Install dependencies
+          command: yarn install
+      - save_cache:
+          key: yarn-packages-v1-{{ .Branch }}-{{ checksum "yarn.lock" }}
+          paths:
+            - ~/.cache/yarn
+            - node_modules/
+      - run:
+          name: Build API Server
+          command: gulp build
+      - run:
+          name: Copy certs to build for deployment
+          command: cp /etc/certs/* ./build
+      - *persist_base_build_workspace
 
-# Invoke jobs via workflows
-# See: https://circleci.com/docs/2.0/configuration-reference/#workflows
+  lint:
+    <<: *base_circle_image
+    steps:
+      - *attach_base_build_workspace
+      - restore_cache:
+          keys:
+            - yarn-packages-v1-{{ .Branch }}-{{ checksum "yarn.lock" }}
+            - yarn-packages-v1-{{ .Branch }}-
+            - yarn-packages-v1-
+      - run:
+          name: Lint code
+          command: gulp lint
+
+  api-test:
+    <<: *base_circle_image
+    environment:
+      TZ: America/Chicago
+    steps:
+      - *attach_base_build_workspace
+      - restore_cache:
+          keys:
+            - yarn-packages-v1-{{ .Branch }}-{{ checksum "yarn.lock" }}
+            - yarn-packages-v1-{{ .Branch }}-
+            - yarn-packages-v1-
+      - run:
+          name: Copy certs for testing
+          command: cp /etc/certs/* .
+      - run:
+          name: Create folder to store test metadata
+          command: mkdir ./junit
+      - run:
+          name: Setup test environment variables
+          command: |
+            echo "export PROPERTIES=BUILD_ID:$CIRCLE_SHA1" >> $BASH_ENV
+            echo "export MOCHA_FILE=./junit/api-test-results.xml" >> $BASH_ENV
+      - run:
+          name: Test
+          command: gulp e2eWithCoverage --junit --htmlCoverage
+      - store_test_results:
+          path: ./junit
+      - store_artifacts:
+          path: ./junit
+      - store_artifacts:
+          path: ./coverage
+
+  integration-test:
+    <<: *base_circle_image
+    environment:
+      TZ: America/Chicago
+    steps:
+      - *attach_base_build_workspace
+      - restore_cache:
+          keys:
+            - yarn-packages-v1-{{ .Branch }}-{{ checksum "yarn.lock" }}
+            - yarn-packages-v1-{{ .Branch }}-
+            - yarn-packages-v1-
+      - run:
+          name: Copy certs for testing
+          command: cp /etc/certs/* .
+      - run:
+          name: Create folder to store test metadata
+          command: mkdir ./junit
+      - run:
+          name: Setup test environment variables
+          command: |
+            echo "export PROPERTIES=BUILD_ID:$CIRCLE_SHA1" >> $BASH_ENV
+            echo "export MOCHA_FILE=./junit/integration-test-results.xml" >> $BASH_ENV
+      - run:
+          name: Test
+          command: gulp integrationTest --junit
+      - store_test_results:
+          path: ./junit
+      - store_artifacts:
+          path: /junit
+
+  deploy-dev:
+    <<: *base_circle_image
+    steps:
+      - setup_remote_docker:
+          version: 19.03.13
+      - *attach_base_build_workspace
+      - run: $(aws ecr get-login --no-include-email --region us-east-1)
+      - run: docker build -t 183303791235.dkr.ecr.us-east-1.amazonaws.com/bnc-api:${CIRCLE_SHA1} .
+      - run: docker push 183303791235.dkr.ecr.us-east-1.amazonaws.com/bnc-api:${CIRCLE_SHA1}
+      - run: docker build -t 183303791235.dkr.ecr.us-east-1.amazonaws.com/sapient-events:${CIRCLE_SHA1} workers/sapient-events/.
+      - run: docker push 183303791235.dkr.ecr.us-east-1.amazonaws.com/sapient-events:${CIRCLE_SHA1}
+      - run:
+          name: Replace deployment yaml
+          command: ./replace.sh dev ${CIRCLE_SHA1}
+      - run: kubectl config use-context bnc-api-dev
+      - run:
+          name: Apply to kubernetes
+          command: kubectl apply -f output/dev/deployments/api.yaml
+      - run:
+          name: Apply sapient events to kubernetes
+          command: kubectl apply -f output/dev/deployments/sapient-events.yaml
+      - store_artifacts:
+          path: output/dev
+
+  deploy-staging:
+    <<: *base_circle_image
+    steps:
+      - setup_remote_docker:
+          version: 19.03.13
+      - *attach_base_build_workspace
+      - run: $(aws ecr get-login --no-include-email --region us-east-1)
+      - run: docker build -t 183303791235.dkr.ecr.us-east-1.amazonaws.com/bnc-api:${CIRCLE_SHA1} .
+      - run: docker push 183303791235.dkr.ecr.us-east-1.amazonaws.com/bnc-api:${CIRCLE_SHA1}
+      - run: docker build -t 183303791235.dkr.ecr.us-east-1.amazonaws.com/sapient-events:${CIRCLE_SHA1} workers/sapient-events/.
+      - run: docker push 183303791235.dkr.ecr.us-east-1.amazonaws.com/sapient-events:${CIRCLE_SHA1}
+      - run:
+          name: Replace deployment yaml
+          command: ./replace.sh staging ${CIRCLE_SHA1} ${CIRCLE_TAG##staging\/}
+      - run: kubectl config use-context bnc-api-staging
+      - run:
+          name: Apply to kubernetes
+          command: kubectl apply -f output/staging/deployments/api.yaml
+      - run:
+          name: Apply sapient events to kubernetes
+          command: kubectl apply -f output/staging/deployments/sapient-events.yaml
+      - store_artifacts:
+          path: output/staging
+
+  deploy-prod:
+    <<: *base_circle_image
+    steps:
+      - setup_remote_docker:
+          version: 19.03.13
+      - *attach_base_build_workspace
+      - run: $(aws ecr get-login --no-include-email --region us-east-1)
+      - run: docker build -t 183303791235.dkr.ecr.us-east-1.amazonaws.com/bnc-api:${CIRCLE_SHA1} .
+      - run: docker push 183303791235.dkr.ecr.us-east-1.amazonaws.com/bnc-api:${CIRCLE_SHA1}
+      - run: docker build -t 183303791235.dkr.ecr.us-east-1.amazonaws.com/sapient-events:${CIRCLE_SHA1} workers/sapient-events/.
+      - run: docker push 183303791235.dkr.ecr.us-east-1.amazonaws.com/sapient-events:${CIRCLE_SHA1}
+      - run:
+          name: Replace deployment yaml
+          command: ./replace.sh production ${CIRCLE_SHA1} ${CIRCLE_TAG##production\/}
+      - run: kubectl config use-context bnc-api-prod
+      - run:
+          name: Apply to kubernetes
+          command: kubectl apply -f output/production/deployments/api.yaml
+      - run:
+          name: Apply sapient events to kubernetes
+          command: kubectl apply -f output/production/deployments/sapient-events.yaml
+      - store_artifacts:
+          path: output/production
+
+# We utilize a tag based deployment workflow off of master
+# When a pull request is merged to master it is deployed to dev after all tests pass
+
+# To trigger builds to other environments do the following
+# Staging:    Create a tag on master with the format `staging/v2.5`
+# Production: Create a tag on master with the format `production/v2.5`
+
 workflows:
-  say-hello-workflow:
+  version: 2
+  build-test-deploy:
     jobs:
-      - say-hello
+      - build-api-server:
+          filters:
+            tags:
+              only: /.*/
+      - lint:
+          requires:
+            - build-api-server
+          filters:
+            tags:
+              only: /.*/
+      - api-test:
+          requires:
+            - build-api-server
+          filters:
+            tags:
+              only: /.*/
+      - integration-test:
+          requires:
+            - build-api-server
+          filters:
+            tags:
+              only: /.*/
+      - deploy-dev:
+          requires:
+            - build-api-server
+            - lint
+            - api-test
+            - integration-test
+          filters:
+            branches:
+              #only: master
+              only: BNCMOBILE-2310/re-branding
+      - deploy-staging:
+          requires:
+            - build-api-server
+            - lint
+            - api-test
+            - integration-test
+          filters:
+            tags:
+              only: /^staging\/v[0-9]+(\.[0-9]+)*$/
+            branches:
+              ignore: /.*/
+      - deploy-prod:
+          requires:
+            - build-api-server
+            - lint
+            - api-test
+            - integration-test
+          filters:
+            tags:
+              only: /^production\/v[0-9]+(\.[0-9]+)*$/
+            branches:
+              ignore: /.*/
